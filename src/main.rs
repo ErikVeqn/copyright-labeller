@@ -1,24 +1,19 @@
-use std::{collections::HashMap, fs::File, io::Cursor, path::PathBuf};
+use std::{collections::HashMap, fs::File, io::Cursor, path::PathBuf, sync::Arc};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use clap::Parser;
-use image::{DynamicImage, GenericImage, GrayImage, ImageBuffer, ImageFormat, ImageReader, Rgb};
-use ocrs::{ImageSource, OcrEngine};
+use futures::future::{join_all, try_join_all};
+use image::{DynamicImage, GenericImage, GrayImage, ImageBuffer, ImageFormat, ImageReader};
+use indicatif::{ProgressBar, ProgressStyle};
+use ocrs::{ImageSource, OcrEngine, TextLine};
 use rten::Model;
 use serde_json::Value;
 
-#[derive(Parser)]
-struct Opts {
-    file: PathBuf,
-}
+const LAUNCH_YEAR: usize = 2007;
+const CURRENT_YEAR: usize = 2025;
 
-async fn download_image(
-    pano_id: &str,
-    zoom: u32,
-    x: u32,
-    y: u32,
-) -> anyhow::Result<ImageBuffer<Rgb<u8>, Vec<u8>>> {
-    log::debug!("Downloading image {pano_id}@{zoom} ({x},{y})");
+async fn download_image(pano_id: &str, zoom: u32, x: u32, y: u32) -> anyhow::Result<DynamicImage> {
+    log::trace!("Downloading image {pano_id}@{zoom} ({x},{y})");
 
     let data = reqwest::get(format!(
         "https://streetviewpixels-pa.googleapis.com/v1/tile?cb_client=apiv3&panoid={pano_id}&zoom={zoom}&x={x}&y={y}",
@@ -27,15 +22,105 @@ async fn download_image(
     .bytes()
     .await?;
 
-    let mut reader = ImageReader::new(Cursor::new(data));
-    reader.set_format(ImageFormat::Jpeg);
-
-    tokio::task::spawn_blocking(|| Ok(reader.decode()?.into_rgb8())).await?
+    tokio::task::spawn_blocking(|| {
+        Ok(ImageReader::with_format(Cursor::new(data), ImageFormat::Jpeg).decode()?)
+    })
+    .await?
 }
 
 fn preprocess(image_buffer: DynamicImage) -> GrayImage {
     let image_buffer = image_buffer.to_luma8();
     imageproc::filter::sharpen_gaussian(&image_buffer, 8.0, 0.8)
+}
+
+#[derive(Copy, Clone, Default)]
+struct Counter([u8; 32]);
+
+impl Counter {
+    fn year(&self) -> usize {
+        let Some(max_idx) = (0..32).max_by_key(|&i| self.0[i]) else {
+            unreachable!("iterator is never empty and thus always has maximum");
+        };
+
+        max_idx + LAUNCH_YEAR
+    }
+
+    fn max(&self) -> u8 {
+        let Some(&max) = self.0.iter().max() else {
+            unreachable!("iterator is never empty and thus always has maximum");
+        };
+
+        max
+    }
+
+    fn increment(&mut self, year: usize) {
+        self.0[year - LAUNCH_YEAR] += 1;
+    }
+}
+
+async fn process_pano(pano_id: &str, engine: Arc<OcrEngine>) -> anyhow::Result<Counter> {
+    let mut counter = Counter::default();
+
+    for zoom in [1, 2, 3, 0] {
+        let x_range = 1 << zoom;
+        let y_range = ((1 << zoom) / 2).max(1);
+
+        let tasks: Vec<_> = (0..x_range * y_range)
+            .map(|i| async move {
+                let x = (i % x_range) as u32;
+                let y = (i / x_range) as u32;
+
+                download_image(pano_id, zoom, x, y)
+                    .await
+                    .map(|image| (x, y, image))
+            })
+            .collect();
+
+        let results = try_join_all(tasks).await?;
+        let mut full_image = ImageBuffer::new(x_range * 512, y_range * 512);
+        for (x, y, image) in results {
+            full_image
+                .sub_image(x * 512, y * 512, 512, 512)
+                .copy_from(&image, 0, 0)?;
+        }
+
+        let engine = engine.clone();
+        let lines = {
+            let img_source = ImageSource::from_bytes(full_image.as_raw(), full_image.dimensions())?;
+            let ocr_input = engine.prepare_input(img_source)?;
+            let word_rects = engine.detect_words(&ocr_input)?;
+
+            let line_rects = engine.find_text_lines(&ocr_input, &word_rects);
+            let line_texts = engine.recognize_text(&ocr_input, &line_rects)?;
+
+            line_texts.into_iter().flatten().collect::<Vec<_>>()
+        };
+
+        // TODO: think about something like "actual" error correction
+        for line in lines {
+            let line = line.to_string();
+
+            log::debug!("Found '{line}' on zoom level {zoom} in pano {pano_id}");
+
+            for year in LAUNCH_YEAR..=CURRENT_YEAR {
+                if line.contains(&format!("{year}")) {
+                    log::info!("found copyright {year} on zoom level {zoom} in pano {pano_id}");
+                    counter.increment(year);
+                }
+            }
+        }
+
+        if counter.max() > 1 {
+            return Ok(counter);
+        }
+    }
+
+    bail!("didn't find copyright")
+}
+
+#[derive(Parser)]
+struct Opts {
+    file: PathBuf,
 }
 
 #[tokio::main]
@@ -45,9 +130,9 @@ async fn main() -> anyhow::Result<()> {
 
     let mut map = serde_json::from_reader::<_, Value>(File::open(&args.file)?)?;
     let locations = map
-        .as_object_mut()
+        .as_object()
         .ok_or(anyhow!("invalid file format: no 'customCoordinates' field"))?["customCoordinates"]
-        .as_array_mut()
+        .as_array()
         .ok_or(anyhow!(
             "invalid file format: 'customCoordinates' is not an array"
         ))?;
@@ -64,93 +149,65 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     })?;
 
-    let zoom = 2;
-    let x_range = 1u32 << zoom;
-    let y_range = 1u32 << (zoom - 1);
+    let bar = ProgressBar::new(locations.len() as _);
+    let sty = ProgressStyle::with_template("{bar:40.green/yellow} {pos:>7}/{len:7}").unwrap();
+    bar.set_style(sty);
 
-    for location in locations.iter_mut() {
-        let pano_id = &location["panoId"]
-            .as_str()
-            .ok_or(anyhow!("location doesn't have a pano id"))
-            .or_else::<anyhow::Error, _>(|_| {
-                Ok(location
-                    .get("extra")
-                    .ok_or(anyhow!("location doesn't have 'panoId' tag _nor_ 'extra'"))?
-                    .get("panoId")
-                    .ok_or(anyhow!("location doesn't have 'panoId' nor 'extra/panoId'"))?
-                    .as_str()
-                    .unwrap())
-            })?;
-
-        let mut full_image = ImageBuffer::new(512 * x_range, 512 * y_range);
+    let mut global_results = Vec::new();
+    let engine = Arc::new(engine);
+    const CHUNK_SIZE: usize = 32;
+    for (global_index, chunk) in locations.chunks(CHUNK_SIZE).enumerate() {
         let mut tasks = Vec::new();
-        for y in 0..y_range {
-            for x in 0..x_range {
-                tasks.push(async move {
-                    download_image(pano_id, zoom, x, y)
-                        .await
-                        .map(|image| (x, y, image))
-                });
+
+        for (local_index, location) in chunk.into_iter().enumerate() {
+            let pano_id = location["panoId"]
+                .as_str()
+                .ok_or(anyhow!("location doesn't have a pano id"))
+                .or_else::<anyhow::Error, _>(|_| {
+                    Ok(location
+                        .get("extra")
+                        .ok_or(anyhow!("location doesn't have 'panoId' tag _nor_ 'extra'"))?
+                        .get("panoId")
+                        .ok_or(anyhow!("location doesn't have 'panoId' nor 'extra/panoId'"))?
+                        .as_str()
+                        .unwrap())
+                })?;
+
+            let engine = Arc::clone(&engine);
+            tasks.push(async move {
+                process_pano(&pano_id, engine)
+                    .await
+                    .map(|counter| (global_index * CHUNK_SIZE + local_index, counter))
+            })
+        }
+
+        let results = join_all(tasks).await;
+        for result in results {
+            if let Ok((index, counter)) = result {
+                global_results.push((index, counter.year(), counter.max()));
             }
         }
 
-        let Ok(images) = futures::future::try_join_all(tasks).await else {
-            log::error!("Encountered error when ");
-            continue;
-        };
+        bar.inc(CHUNK_SIZE as _);
+    }
 
-        for (x, y, image) in images {
-            full_image
-                .sub_image(x * 512, y * 512, 512, 512)
-                .copy_from(&image, 0, 0)?;
-        }
+    bar.finish();
 
-        let img = preprocess(full_image.into());
-
-        let img_source = ImageSource::from_bytes(img.as_raw(), img.dimensions())?;
-        let ocr_input = engine.prepare_input(img_source)?;
-        let word_rects = engine.detect_words(&ocr_input)?;
-
-        let line_rects = engine.find_text_lines(&ocr_input, &word_rects);
-        let line_texts = engine.recognize_text(&ocr_input, &line_rects)?;
-
-        let mut counts = HashMap::new();
-        for line in line_texts.iter().flatten() {
-            for year in 2009..=2025 {
-                if !line.to_string().contains(&format!("{year}")) {
-                    continue;
-                }
-
-                counts
-                    .entry(year)
-                    .and_modify(|c| {
-                        *c += 1;
-                    })
-                    .or_insert(1);
-            }
-        }
-
-        if let Some((year, c)) = counts.iter().max_by_key(|(_, v)| **v) {
-            log::info!("{pano_id}: {year} (found {c} times)");
-
-            let tag = Value::String(format!("CR {year}"));
-            location
-                .as_object_mut()
-                .unwrap()
-                .entry("extra")
-                .and_modify(|extra| {
-                    extra
-                        .as_object_mut()
-                        .unwrap()
-                        .entry("tags")
-                        .and_modify(|f| {
-                            f.as_array_mut().unwrap().push(tag.clone());
-                        })
-                        .or_insert_with(|| Value::Array(vec![tag]));
-                });
-        } else {
-            log::info!("No copyright found for {pano_id}")
-        }
+    for (index, copyright, count) in global_results {
+        map["customCoordinates"].as_array_mut().unwrap()[index]["extra"]
+            .as_object_mut()
+            .unwrap()
+            .entry("tags")
+            .and_modify(|tags| {
+                tags.as_array_mut().unwrap().append(&mut vec![
+                    Value::String(format!("CR {copyright}")),
+                    Value::String(format!("CR Count {count}")),
+                ]);
+            })
+            .or_insert(Value::Array(vec![
+                Value::String(format!("CR {copyright}")),
+                Value::String(format!("CR Count {count}")),
+            ]));
     }
 
     serde_json::to_writer(File::create("out.json")?, &map)?;
