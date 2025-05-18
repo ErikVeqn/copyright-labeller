@@ -38,7 +38,7 @@ impl Counter {
     /// Returns the year that was found most often
     /// (year, count)
     fn best(&self) -> Option<(Year, Count)> {
-        let (&year, &count) = self.0.last_key_value()?;
+        let (&year, &count) = self.0.iter().max_by_key(|&(_, v)| v)?;
         Some((year, count))
     }
 
