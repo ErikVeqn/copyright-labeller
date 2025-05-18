@@ -1,11 +1,12 @@
-use std::{collections::HashMap, fs::File, io::Cursor, path::PathBuf, sync::Arc};
+use std::collections::HashMap;
+use std::{fs::File, io::Cursor, path::PathBuf, sync::Arc};
 
 use anyhow::{anyhow, bail};
 use clap::Parser;
 use futures::future::{join_all, try_join_all};
 use image::{DynamicImage, GenericImage, GrayImage, ImageBuffer, ImageFormat, ImageReader};
 use indicatif::{ProgressBar, ProgressStyle};
-use ocrs::{ImageSource, OcrEngine, TextLine};
+use ocrs::{ImageSource, OcrEngine};
 use rten::Model;
 use serde_json::Value;
 
@@ -120,7 +121,10 @@ async fn process_pano(pano_id: &str, engine: Arc<OcrEngine>) -> anyhow::Result<C
 
 #[derive(Parser)]
 struct Opts {
-    file: PathBuf,
+    /// the json to add copyright labels to
+    map: PathBuf,
+    /// the location to store the labelled map in. If no location is specified, './out.json' is used
+    out: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -128,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
     pretty_env_logger::init();
     let args = Opts::parse();
 
-    let mut map = serde_json::from_reader::<_, Value>(File::open(&args.file)?)?;
+    let mut map = serde_json::from_reader::<_, Value>(File::open(&args.map)?)?;
     let locations = map
         .as_object()
         .ok_or(anyhow!("invalid file format: no 'customCoordinates' field"))?["customCoordinates"]
@@ -137,10 +141,8 @@ async fn main() -> anyhow::Result<()> {
             "invalid file format: 'customCoordinates' is not an array"
         ))?;
 
-    let detection_model =
-        Model::load_file(PathBuf::from("/home/igs/.cache/ocrs/text-detection.rten"))?;
-    let recognition_model =
-        Model::load_file(PathBuf::from("/home/igs/.cache/ocrs/text-recognition.rten"))?;
+    let detection_model = Model::load_file(PathBuf::from("models/text-detection.rten"))?;
+    let recognition_model = Model::load_file(PathBuf::from("models/text-recognition.rten"))?;
 
     let engine = OcrEngine::new(ocrs::OcrEngineParams {
         detection_model: Some(detection_model),
@@ -155,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut global_results = Vec::new();
     let engine = Arc::new(engine);
-    const CHUNK_SIZE: usize = 32;
+    const CHUNK_SIZE: usize = 4;
     for (global_index, chunk) in locations.chunks(CHUNK_SIZE).enumerate() {
         let mut tasks = Vec::new();
 
@@ -194,9 +196,15 @@ async fn main() -> anyhow::Result<()> {
     bar.finish();
 
     for (index, copyright, count) in global_results {
-        map["customCoordinates"].as_array_mut().unwrap()[index]["extra"]
-            .as_object_mut()
-            .unwrap()
+        let custom_coordinates = map["customCoordinates"].as_array_mut().unwrap();
+        let loc = custom_coordinates[index].as_object_mut().unwrap();
+        if !loc.contains_key("extra") {
+            loc.insert("extra".into(), Value::Object(Default::default()));
+        }
+
+        let extra = loc["extra"].as_object_mut().unwrap();
+
+        extra
             .entry("tags")
             .and_modify(|tags| {
                 tags.as_array_mut().unwrap().append(&mut vec![
@@ -210,6 +218,9 @@ async fn main() -> anyhow::Result<()> {
             ]));
     }
 
-    serde_json::to_writer(File::create("out.json")?, &map)?;
+    serde_json::to_writer(
+        File::create(args.out.unwrap_or_else(|| PathBuf::from("out.json")))?,
+        &map,
+    )?;
     Ok(())
 }
