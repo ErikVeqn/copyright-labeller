@@ -6,20 +6,27 @@ use anyhow::{anyhow, bail};
 use clap::Parser;
 use futures::future::{join_all, try_join_all};
 use geo::Map;
-use image::{DynamicImage, GenericImage, ImageBuffer, ImageFormat, ImageReader};
+use image::{DynamicImage, GenericImage, GrayImage, ImageBuffer, ImageFormat, ImageReader};
 use indicatif::{ProgressBar, ProgressStyle};
-use ocrs::{ImageSource, OcrEngine, TextLine};
+use ocrs::{ImageSource, OcrEngine};
+use reqwest::{Client, ClientBuilder};
 use rten::Model;
 
 const LAUNCH_YEAR: usize = 2007;
 const CURRENT_YEAR: usize = 2025;
 
-async fn download_image(pano_id: &str, zoom: u32, x: u32, y: u32) -> anyhow::Result<DynamicImage> {
+async fn download_image(
+    client: &Client,
+    pano_id: &str,
+    zoom: u32,
+    x: u32,
+    y: u32,
+) -> anyhow::Result<DynamicImage> {
     log::debug!("Downloading image {pano_id}@{zoom} ({x},{y})");
 
-    let data = reqwest::get(format!(
+    let data = client.get(format!(
         "https://streetviewpixels-pa.googleapis.com/v1/tile?cb_client=apiv3&panoid={pano_id}&zoom={zoom}&x={x}&y={y}",
-    ))
+    )).send()
     .await?
     .bytes()
     .await?;
@@ -52,7 +59,15 @@ impl Counter {
     }
 }
 
-async fn process_pano(pano_id: &str, engine: Arc<OcrEngine>) -> anyhow::Result<(Year, Count)> {
+fn preprocess(image: DynamicImage) -> GrayImage {
+    image.to_luma8()
+}
+
+async fn process_pano(
+    pano_id: &str,
+    engine: Arc<OcrEngine>,
+    client: &Client,
+) -> anyhow::Result<(Year, Count)> {
     let mut counter = Counter::default();
 
     // start at zoom level 1, because zoom level zero is "usually" bad (ocr doesn't find copyrights)
@@ -67,7 +82,7 @@ async fn process_pano(pano_id: &str, engine: Arc<OcrEngine>) -> anyhow::Result<(
                 let x = i % x_range;
                 let y = i / x_range;
 
-                download_image(pano_id, zoom, x, y)
+                download_image(client, pano_id, zoom, x, y)
                     .await
                     .map(|image| (x, y, image))
             })
@@ -75,17 +90,19 @@ async fn process_pano(pano_id: &str, engine: Arc<OcrEngine>) -> anyhow::Result<(
 
         let results = try_join_all(tasks).await?;
         let mut full_image = ImageBuffer::new(x_range * 512, y_range * 512);
+
         for (x, y, image) in results {
             full_image
                 .sub_image(x * 512, y * 512, 512, 512)
-                .copy_from(&image, 0, 0)?;
+                .copy_from(&image, 0, 0)
+                .unwrap();
         }
 
         // TODO: preprocessing
-        // let full_image = preprocess(full_image);
+        let full_image = preprocess(full_image.into());
 
         let engine = engine.clone();
-        let lines: Vec<TextLine> = {
+        let lines: Vec<String> = tokio::task::spawn_blocking::<_, anyhow::Result<_>>(move || {
             let img_source = ImageSource::from_bytes(full_image.as_raw(), full_image.dimensions())?;
             let ocr_input = engine.prepare_input(img_source)?;
             let word_rects = engine.detect_words(&ocr_input)?;
@@ -93,20 +110,22 @@ async fn process_pano(pano_id: &str, engine: Arc<OcrEngine>) -> anyhow::Result<(
             let line_rects = engine.find_text_lines(&ocr_input, &word_rects);
             let line_texts = engine.recognize_text(&ocr_input, &line_rects)?;
 
-            line_texts.into_iter().flatten().collect()
-        };
+            Ok(line_texts
+                .into_iter()
+                .flatten()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>())
+        })
+        .await??;
 
-        // TODO: think about something like "actual" error correction
         for line in lines {
-            let line = line.to_string();
-
             log::trace!("Found '{line}' on zoom level {zoom} in pano {pano_id}");
 
-            for year in LAUNCH_YEAR..=CURRENT_YEAR {
-                if line.contains(&format!("{year}")) {
-                    log::debug!("found copyright {year} on zoom level {zoom} in pano {pano_id}");
-                    counter.increment(year);
-                }
+            // TODO: think about something like "actual" error correction
+            for year in (LAUNCH_YEAR..=CURRENT_YEAR).filter(|year| line.contains(&year.to_string()))
+            {
+                log::debug!("found copyright {year} on zoom level {zoom} in pano {pano_id}");
+                counter.increment(year);
             }
         }
 
@@ -145,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
         allowed_chars: Some("1234567890 Google".to_owned()),
         ..Default::default()
     })?;
+    let client = ClientBuilder::new().build()?;
 
     let bar = ProgressBar::new(map.locations.len() as _);
     bar.set_style(
@@ -161,6 +181,7 @@ async fn main() -> anyhow::Result<()> {
     const BATCH_SIZE: usize = 4;
 
     let engine = Arc::new(engine);
+    let client = Arc::new(client);
     let mut global_results = Vec::new();
     for (global_index, chunk) in map.locations.chunks(BATCH_SIZE).enumerate() {
         let mut tasks = Vec::new();
@@ -172,8 +193,9 @@ async fn main() -> anyhow::Result<()> {
                 .ok_or(anyhow!("Location {index} doesn't have pano id"))?;
 
             let engine = Arc::clone(&engine);
+            let client = Arc::clone(&client);
             tasks.push(async move {
-                process_pano(pano_id, engine)
+                process_pano(pano_id, engine, &client)
                     .await
                     .map(|counter| (index, counter))
             })
