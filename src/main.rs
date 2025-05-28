@@ -73,7 +73,7 @@ async fn process_pano(
     // start at zoom level 1, because zoom level zero is "usually" bad (ocr doesn't find copyrights)
     // If we don't find any copyrights for level 1, 2 or 3, we might aswell download one more image
     // and try zoom level zero, though.
-    for zoom in [1, 2, 3, 0] {
+    for zoom in 1..=3 {
         let x_range = 1 << zoom;
         let y_range = ((1 << zoom) / 2).max(1);
 
@@ -128,13 +128,13 @@ async fn process_pano(
                 counter.increment(year);
             }
         }
+    }
 
-        match counter.best() {
-            Some(best @ (_, best_count)) if best_count > 1 => {
-                return Ok(best);
-            }
-            _ => {}
+    match counter.best() {
+        Some(best @ (_, best_count)) if best_count > 1 => {
+            return Ok(best);
         }
+        _ => {}
     }
 
     bail!("didn't find copyright")
@@ -178,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
     // tick the bar once so it shows up directly
     bar.tick();
 
-    const BATCH_SIZE: usize = 4;
+    const BATCH_SIZE: usize = 16;
 
     let engine = Arc::new(engine);
     let client = Arc::new(client);
@@ -218,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
             .get_or_insert_default()
             .tags
             .get_or_insert_default()
-            .extend_from_slice(&[format!("CR {copyright}"), format!("CR Count {count}")]);
+            .extend_from_slice(&[format!("©{copyright}")]);
     }
 
     serde_json::to_writer(
