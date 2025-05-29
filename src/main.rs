@@ -2,7 +2,7 @@ pub mod geo;
 
 use std::{collections::BTreeMap, fs::File, io::Cursor, path::PathBuf, sync::Arc};
 
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use clap::Parser;
 use futures::future::join_all;
 use geo::Map;
@@ -206,10 +206,10 @@ async fn main() -> anyhow::Result<()> {
     let mut tasks = Vec::new();
     let semaphore = Arc::new(Semaphore::new(LIMIT));
     for (index, location) in map.locations.iter().enumerate() {
-        let pano_id = location
-            .pano_id()
-            .ok_or(anyhow!("Location {index} doesn't have pano id"))?
-            .to_owned();
+        let Some(pano_id) = location.pano_id().map(ToString::to_string) else {
+            println!("location {index} doesn't have pano id");
+            continue;
+        };
 
         let engine = Arc::clone(&engine);
         let client = Arc::clone(&client);
