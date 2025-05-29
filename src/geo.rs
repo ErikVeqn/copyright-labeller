@@ -43,6 +43,7 @@ pub struct Location {
     pub pano_id: Option<String>,
     pub country_code: Option<String>,
     pub state_code: Option<String>,
+    pub image_date: Option<String>,
 }
 
 impl Location {
@@ -54,6 +55,15 @@ impl Location {
             .as_ref()
             .and_then(|extra| extra.pano_id.as_deref());
         self.pano_id.as_deref().or(extra_pano_id)
+    }
+
+    pub fn image_date(&self) -> Option<&str> {
+        let extra_image_date = self
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.pano_date.as_deref());
+
+        self.image_date.as_deref().or(extra_image_date)
     }
 }
 

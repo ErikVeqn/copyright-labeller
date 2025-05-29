@@ -4,13 +4,14 @@ use std::{collections::BTreeMap, fs::File, io::Cursor, path::PathBuf, sync::Arc}
 
 use anyhow::{anyhow, bail};
 use clap::Parser;
-use futures::future::{join_all, try_join_all};
+use futures::future::join_all;
 use geo::Map;
 use image::{DynamicImage, GenericImage, GrayImage, ImageBuffer, ImageFormat, ImageReader};
 use indicatif::{ProgressBar, ProgressStyle};
 use ocrs::{ImageSource, OcrEngine};
 use reqwest::{Client, ClientBuilder};
 use rten::Model;
+use tokio::sync::Semaphore;
 
 const LAUNCH_YEAR: usize = 2007;
 const CURRENT_YEAR: usize = 2025;
@@ -70,32 +71,26 @@ async fn process_pano(
 ) -> anyhow::Result<(Year, Count)> {
     let mut counter = Counter::default();
 
-    // start at zoom level 1, because zoom level zero is "usually" bad (ocr doesn't find copyrights)
-    // If we don't find any copyrights for level 1, 2 or 3, we might aswell download one more image
-    // and try zoom level zero, though.
-    for zoom in 1..=3 {
+    for zoom in [1, 2, 3, 0] {
         let x_range = 1 << zoom;
         let y_range = ((1 << zoom) / 2).max(1);
 
-        let tasks: Vec<_> = (0..x_range * y_range)
-            .map(|i| async move {
-                let x = i % x_range;
-                let y = i / x_range;
-
-                download_image(client, pano_id, zoom, x, y)
-                    .await
-                    .map(|image| (x, y, image))
-            })
-            .collect();
-
-        let results = try_join_all(tasks).await?;
         let mut full_image = ImageBuffer::new(x_range * 512, y_range * 512);
+        for i in 0..x_range * y_range {
+            let x = i % x_range;
+            let y = i / x_range;
 
-        for (x, y, image) in results {
-            full_image
-                .sub_image(x * 512, y * 512, 512, 512)
-                .copy_from(&image, 0, 0)
-                .unwrap();
+            let image = download_image(client, pano_id, zoom, x, y).await.unwrap();
+            full_image = tokio::task::spawn_blocking(move || {
+                full_image
+                    .sub_image(x * 512, y * 512, 512, 512)
+                    .copy_from(&image, 0, 0)
+                    .unwrap();
+
+                full_image
+            })
+            .await
+            .unwrap();
         }
 
         // TODO: preprocessing
@@ -128,13 +123,13 @@ async fn process_pano(
                 counter.increment(year);
             }
         }
-    }
 
-    match counter.best() {
-        Some(best @ (_, best_count)) if best_count > 1 => {
-            return Ok(best);
+        match counter.best() {
+            Some(best @ (_, best_count)) if best_count > 1 => {
+                return Ok(best);
+            }
+            _ => {}
         }
-        _ => {}
     }
 
     bail!("didn't find copyright")
@@ -146,6 +141,9 @@ struct Opts {
     map: PathBuf,
     /// the location to store the labelled map in. If no location is specified, './out.json' is used
     out: Option<PathBuf>,
+
+    #[arg(long, default_value = "false")]
+    coverage: bool,
 }
 
 #[tokio::main]
@@ -154,6 +152,28 @@ async fn main() -> anyhow::Result<()> {
     let args = Opts::parse();
 
     let mut map: Map = serde_json::from_reader(File::open(&args.map)?)?;
+
+    if args.coverage {
+        map.locations.iter_mut().for_each(|loc| {
+            let Some((year, _month)) = loc.image_date().and_then(|date| date.split_once('-'))
+            else {
+                return;
+            };
+
+            let copyright_label = format!("{year}");
+            loc.extra
+                .get_or_insert_default()
+                .tags
+                .get_or_insert_default()
+                .extend_from_slice(&[copyright_label]);
+        });
+
+        serde_json::to_writer(
+            File::create(args.out.unwrap_or_else(|| PathBuf::from("out.json")))?,
+            &map,
+        )?;
+        return Ok(());
+    }
 
     let detection_model = Model::load_file(PathBuf::from("models/text-detection.rten"))?;
     let recognition_model = Model::load_file(PathBuf::from("models/text-recognition.rten"))?;
@@ -178,41 +198,47 @@ async fn main() -> anyhow::Result<()> {
     // tick the bar once so it shows up directly
     bar.tick();
 
-    const BATCH_SIZE: usize = 16;
+    const LIMIT: usize = 64;
 
     let engine = Arc::new(engine);
     let client = Arc::new(client);
     let mut global_results = Vec::new();
-    for (global_index, chunk) in map.locations.chunks(BATCH_SIZE).enumerate() {
-        let mut tasks = Vec::new();
+    let mut tasks = Vec::new();
+    let semaphore = Arc::new(Semaphore::new(LIMIT));
+    for (index, location) in map.locations.iter().enumerate() {
+        let pano_id = location
+            .pano_id()
+            .ok_or(anyhow!("Location {index} doesn't have pano id"))?
+            .to_owned();
 
-        for (local_index, location) in chunk.iter().enumerate() {
-            let index = global_index * BATCH_SIZE + local_index;
-            let pano_id = location
-                .pano_id()
-                .ok_or(anyhow!("Location {index} doesn't have pano id"))?;
+        let engine = Arc::clone(&engine);
+        let client = Arc::clone(&client);
 
-            let engine = Arc::clone(&engine);
-            let client = Arc::clone(&client);
-            tasks.push(async move {
-                process_pano(pano_id, engine, &client)
-                    .await
-                    .map(|counter| (index, counter))
-            })
-        }
+        let semaphore = semaphore.clone();
+        let permit = semaphore.acquire_owned().await.unwrap();
 
-        let results = join_all(tasks).await;
-        for result in results.into_iter().flatten() {
-            let (index, (copyright_year, count)) = result;
-            global_results.push((index, copyright_year, count));
-        }
+        let bar = bar.clone();
+        tasks.push(tokio::spawn(async move {
+            let _permit = permit;
 
-        bar.inc(BATCH_SIZE as _);
+            let result = process_pano(&pano_id, engine, &client)
+                .await
+                .map(|counter| (index, counter));
+
+            bar.inc(1);
+            result
+        }));
+    }
+
+    let results = join_all(tasks).await;
+    for result in results.into_iter().flatten().flatten() {
+        let (index, (copyright_year, count)) = result;
+        global_results.push((index, copyright_year, count));
     }
 
     bar.finish_and_clear();
 
-    for (index, copyright, count) in global_results {
+    for (index, copyright, _count) in global_results {
         map.locations[index]
             .extra
             .get_or_insert_default()
