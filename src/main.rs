@@ -13,138 +13,150 @@ use reqwest::{Client, ClientBuilder};
 use rten::Model;
 use tokio::sync::Semaphore;
 
+/* ───────────────────────────── constants ──────────────────────────────── */
+
 const LAUNCH_YEAR: usize = 2007;
 const CURRENT_YEAR: usize = 2025;
 
+/// Maximum tasks (locations) processed simultaneously
+const TASK_LIMIT: usize = 512;
+/// Maximum concurrent HTTP tile downloads
+const DOWNLOAD_LIMIT: usize = 256;
+/// Maximum concurrent OCR / inference jobs
+const INFERENCE_LIMIT: usize = 256;
+
+/* ───────────────────────────── helpers ────────────────────────────────── */
+
 async fn download_image(
     client: &Client,
+    download_sem: Arc<Semaphore>,
     pano_id: &str,
     zoom: u32,
     x: u32,
     y: u32,
 ) -> anyhow::Result<DynamicImage> {
+    let _permit = download_sem.acquire_owned().await.unwrap();
+
     log::debug!("Downloading image {pano_id}@{zoom} ({x},{y})");
 
-    let data = client.get(format!(
-        "https://streetviewpixels-pa.googleapis.com/v1/tile?cb_client=apiv3&panoid={pano_id}&zoom={zoom}&x={x}&y={y}",
-    )).send()
-    .await?
-    .bytes()
-    .await?;
+    let data = client
+        .get(format!(
+            "https://streetviewpixels-pa.googleapis.com/v1/tile?cb_client=apiv3&panoid={pano_id}&zoom={zoom}&x={x}&y={y}"
+        ))
+        .send()
+        .await?
+        .bytes()
+        .await?;
 
     Ok(ImageReader::with_format(Cursor::new(data), ImageFormat::Jpeg).decode()?)
 }
 
 type Year = usize;
-
 type Count = usize;
 
 #[derive(Clone, Default)]
 struct Counter(BTreeMap<Year, Count>);
 
 impl Counter {
-    /// Returns the year that was found most often
-    /// (year, count)
     fn best(&self) -> Option<(Year, Count)> {
         let (&year, &count) = self.0.iter().max_by_key(|&(_, v)| v)?;
         Some((year, count))
     }
-
     fn increment(&mut self, year: Year) {
-        self.0
-            .entry(year)
-            .and_modify(|v| {
-                *v += 1;
-            })
-            .or_insert(1);
+        self.0.entry(year).and_modify(|v| *v += 1).or_insert(1);
     }
 }
 
-fn preprocess(image: DynamicImage) -> GrayImage {
-    image.to_luma8()
+fn preprocess(img: DynamicImage) -> GrayImage {
+    img.to_luma8()
 }
 
 async fn process_pano(
     pano_id: &str,
     engine: Arc<OcrEngine>,
     client: &Client,
+    download_sem: Arc<Semaphore>,
+    infer_sem: Arc<Semaphore>,
 ) -> anyhow::Result<(Year, Count)> {
     let mut counter = Counter::default();
 
-    for zoom in [1, 2, 3, 0] {
+    for &zoom in &[2] {
         let x_range = 1 << zoom;
         let y_range = ((1 << zoom) / 2).max(1);
 
-        let mut full_image = ImageBuffer::new(x_range * 512, y_range * 512);
+        let mut full = ImageBuffer::new(x_range * 512, y_range * 512);
+
         for i in 0..x_range * y_range {
             let x = i % x_range;
             let y = i / x_range;
 
-            let image = download_image(client, pano_id, zoom, x, y).await.unwrap();
-            full_image = tokio::task::spawn_blocking(move || {
-                full_image
-                    .sub_image(x * 512, y * 512, 512, 512)
-                    .copy_from(&image, 0, 0)
+            let tile =
+                download_image(client, Arc::clone(&download_sem), pano_id, zoom, x, y).await?;
+            full = tokio::task::spawn_blocking(move || {
+                full.sub_image(x * 512, y * 512, 512, 512)
+                    .copy_from(&tile, 0, 0)
                     .unwrap();
-
-                full_image
+                full
             })
             .await
             .unwrap();
         }
 
-        // TODO: preprocessing
-        let full_image = preprocess(full_image.into());
+        let gray = preprocess(full.into());
 
-        let engine = engine.clone();
-        let lines: Vec<String> = tokio::task::spawn_blocking::<_, anyhow::Result<_>>(move || {
-            let img_source = ImageSource::from_bytes(full_image.as_raw(), full_image.dimensions())?;
-            let ocr_input = engine.prepare_input(img_source)?;
-            let word_rects = engine.detect_words(&ocr_input)?;
+        /* ---- OCR guarded by INFERENCE semaphore ------------------------- */
+        let permit = infer_sem.clone().acquire_owned().await.unwrap();
+        let engine_cloned = Arc::clone(&engine);
 
-            let line_rects = engine.find_text_lines(&ocr_input, &word_rects);
-            let line_texts = engine.recognize_text(&ocr_input, &line_rects)?;
+        let lines: Vec<String> = tokio::task::spawn_blocking(move || {
+            let _permit = permit; // kept until this block returns
 
-            Ok(line_texts
-                .into_iter()
-                .flatten()
-                .map(|l| l.to_string())
-                .collect::<Vec<_>>())
+            let src = ImageSource::from_bytes(gray.as_raw(), gray.dimensions())?;
+            let ocr_in = engine_cloned.prepare_input(src)?;
+            let words = engine_cloned.detect_words(&ocr_in)?;
+
+            let lines_rect = engine_cloned.find_text_lines(&ocr_in, &words);
+            let texts = engine_cloned.recognize_text(&ocr_in, &lines_rect)?;
+
+            Ok::<_, anyhow::Error>(
+                texts
+                    .into_iter()
+                    .flatten()
+                    .map(|l| l.to_string())
+                    .collect::<Vec<_>>(),
+            )
         })
         .await??;
 
         for line in lines {
-            log::trace!("Found '{line}' on zoom level {zoom} in pano {pano_id}");
-
-            // TODO: think about something like "actual" error correction
-            for year in (LAUNCH_YEAR..=CURRENT_YEAR).filter(|year| line.contains(&year.to_string()))
-            {
-                log::debug!("found copyright {year} on zoom level {zoom} in pano {pano_id}");
+            for year in (LAUNCH_YEAR..=CURRENT_YEAR).filter(|y| line.contains(&y.to_string())) {
                 counter.increment(year);
             }
         }
-
-        match counter.best() {
-            Some(best @ (_, best_count)) if best_count > 1 => {
-                return Ok(best);
+        if let Some((_, c)) = counter.best() {
+            if c > 1 {
+                return Ok(counter.best().unwrap());
             }
-            _ => {}
         }
     }
 
     bail!("didn't find copyright")
 }
 
+/* ───────────────────────────── CLI opts ───────────────────────────────── */
+
 #[derive(Parser)]
 struct Opts {
-    /// the json to add copyright labels to
+    /// Input JSON map
     map: PathBuf,
-    /// the location to store the labelled map in. If no location is specified, './out.json' is used
+    /// Output file (default: out.json)
     out: Option<PathBuf>,
-
+    /// Only tag by coverage year, skip OCR
     #[arg(long, default_value = "false")]
     coverage: bool,
 }
+
+/* ───────────────────────────── main ───────────────────────────────────── */
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -153,21 +165,21 @@ async fn main() -> anyhow::Result<()> {
 
     let mut map: Map = serde_json::from_reader(File::open(&args.map)?)?;
 
+    /* -- quick “coverage only” path ------------------------------------- */
     if args.coverage {
         map.locations.iter_mut().for_each(|loc| {
-            let Some((year, _month)) = loc.image_date().and_then(|date| date.split_once('-'))
-            else {
+            let Some((year, _)) = loc.image_date().and_then(|d| d.split_once('-')) else {
                 return;
             };
 
-            let copyright_label = format!("{year}");
+            let year = year.to_owned();
+
             loc.extra
                 .get_or_insert_default()
                 .tags
                 .get_or_insert_default()
-                .extend_from_slice(&[copyright_label]);
+                .extend_from_slice(&[year]);
         });
-
         serde_json::to_writer(
             File::create(args.out.unwrap_or_else(|| PathBuf::from("out.json")))?,
             &map,
@@ -175,76 +187,82 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let detection_model = Model::load_file(PathBuf::from("models/text-detection.rten"))?;
-    let recognition_model = Model::load_file(PathBuf::from("models/text-recognition.rten"))?;
+    /* -- heavy-path initialisation -------------------------------------- */
+    let detection = Model::load_file("models/text-detection.rten")?;
+    let recognition = Model::load_file("models/text-recognition.rten")?;
 
-    let engine = OcrEngine::new(ocrs::OcrEngineParams {
-        detection_model: Some(detection_model),
-        recognition_model: Some(recognition_model),
-        allowed_chars: Some("1234567890 Google".to_owned()),
+    let engine = Arc::new(OcrEngine::new(ocrs::OcrEngineParams {
+        detection_model: Some(detection),
+        recognition_model: Some(recognition),
+        allowed_chars: Some("1234567890 Google".into()),
         ..Default::default()
-    })?;
-    let client = ClientBuilder::new().build()?;
+    })?);
+    let client = Arc::new(ClientBuilder::new().build()?);
 
-    let bar = ProgressBar::new(map.locations.len() as _);
+    /* -- semaphores ------------------------------------------------------ */
+    let task_sem = Arc::new(Semaphore::new(TASK_LIMIT));
+    let download_sem = Arc::new(Semaphore::new(DOWNLOAD_LIMIT));
+    let infer_sem = Arc::new(Semaphore::new(INFERENCE_LIMIT));
+
+    /* -- progress bar ---------------------------------------------------- */
+    let bar = ProgressBar::new(map.locations.len() as u64);
     bar.set_style(
         ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{wide_bar:40.cyan/blue}] ({pos}/{len}, ETA {eta})",
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:40.cyan/blue}] \
+             {pos}/{len} • ETA {eta}",
         )
         .unwrap()
         .progress_chars("=> "),
     );
-
-    // tick the bar once so it shows up directly
     bar.tick();
 
-    const LIMIT: usize = 64;
-
-    let engine = Arc::new(engine);
-    let client = Arc::new(client);
-    let mut global_results = Vec::new();
+    /* -- spawn per-location tasks --------------------------------------- */
     let mut tasks = Vec::new();
-    let semaphore = Arc::new(Semaphore::new(LIMIT));
-    for (index, location) in map.locations.iter().enumerate() {
-        let Some(pano_id) = location.pano_id().map(ToString::to_string) else {
-            println!("location {index} doesn't have pano id");
+    for (idx, loc) in map.locations.iter().enumerate() {
+        let Some(pano_id) = loc.pano_id().map(ToString::to_string) else {
+            log::warn!("location {idx} has no pano_id – skipping");
             continue;
         };
 
+        /* limit number of simultaneous spawned tasks */
+        let permit = task_sem.clone().acquire_owned().await.unwrap();
+
         let engine = Arc::clone(&engine);
         let client = Arc::clone(&client);
-
-        let semaphore = semaphore.clone();
-        let permit = semaphore.acquire_owned().await.unwrap();
-
+        let d_sem = Arc::clone(&download_sem);
+        let i_sem = Arc::clone(&infer_sem);
         let bar = bar.clone();
+
         tasks.push(tokio::spawn(async move {
+            /* keep permit alive for task’s lifetime */
             let _permit = permit;
 
-            let result = process_pano(&pano_id, engine, &client)
+            let result = process_pano(&pano_id, engine, &client, d_sem, i_sem)
                 .await
-                .map(|counter| (index, counter));
+                .map(|r| (idx, r));
 
             bar.inc(1);
             result
         }));
     }
 
-    let results = join_all(tasks).await;
-    for result in results.into_iter().flatten().flatten() {
-        let (index, (copyright_year, count)) = result;
-        global_results.push((index, copyright_year, count));
+    /* -- collect results ------------------------------------------------- */
+    let mut global = Vec::<(usize, Year, Count)>::new();
+    for res in join_all(tasks).await {
+        if let Ok(Ok((idx, (year, cnt)))) = res {
+            global.push((idx, year, cnt));
+        }
     }
-
     bar.finish_and_clear();
 
-    for (index, copyright, _count) in global_results {
-        map.locations[index]
+    /* -- tag JSON map ---------------------------------------------------- */
+    for (idx, year, _) in global {
+        map.locations[idx]
             .extra
             .get_or_insert_default()
             .tags
             .get_or_insert_default()
-            .extend_from_slice(&[format!("©{copyright}")]);
+            .extend_from_slice(&[format!("©{year}")]);
     }
 
     serde_json::to_writer(
